@@ -7,7 +7,6 @@
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings, useSettings } from "@api/Settings";
 import ErrorBoundary from "@components/ErrorBoundary";
-import { Devs } from "@utils/constants";
 import { classes } from "@utils/misc";
 import definePlugin, { OptionType } from "@utils/types";
 import type { Channel, User } from "@vencord/discord-types";
@@ -110,15 +109,35 @@ export const settings = definePluginSettings({
         hidden: true,
         default: "",
     },
+    serverMuteUserId: {
+        type: OptionType.STRING,
+        description: "Target user ID to auto-server-mute",
+        restartNeeded: false,
+        hidden: true,
+        default: "",
+    },
+    serverDeafenUserId: {
+        type: OptionType.STRING,
+        description: "Target user ID to auto-server-deafen",
+        restartNeeded: false,
+        hidden: true,
+        default: "",
+    },
 });
 
 const Auth: { getToken: () => string; } = findByPropsLazy("getToken");
 
-async function disconnectGuildMember(guildId: string, userId: string) {
+interface GuildMemberPatchAction {
+    verb: string;
+    pastTense: string;
+    presentParticiple: string;
+}
+
+async function patchGuildMember(guildId: string, userId: string, body: Record<string, unknown>, action: GuildMemberPatchAction) {
     const token = Auth?.getToken?.();
     if (!token) {
         Toasts.show({
-            message: "Cannot get auth token to disconnect user",
+            message: `Cannot get auth token to ${action.verb} user`,
             id: Toasts.genId(),
             type: Toasts.Type.FAILURE
         });
@@ -132,29 +151,53 @@ async function disconnectGuildMember(guildId: string, userId: string) {
                 "Authorization": token,
                 "Content-Type": "application/json"
             },
-            body: JSON.stringify({ channel_id: null })
+            body: JSON.stringify(body)
         });
 
         if (response.ok) {
             Toasts.show({
-                message: "User disconnected from voice",
+                message: `User ${action.pastTense}`,
                 id: Toasts.genId(),
                 type: Toasts.Type.SUCCESS
             });
         } else {
             Toasts.show({
-                message: `Failed to disconnect user (${response.status})`,
+                message: `Failed to ${action.verb} user (${response.status})`,
                 id: Toasts.genId(),
                 type: Toasts.Type.FAILURE
             });
         }
     } catch (error) {
         Toasts.show({
-            message: "Network error while disconnecting user",
+            message: `Network error while ${action.presentParticiple} user`,
             id: Toasts.genId(),
             type: Toasts.Type.FAILURE
         });
     }
+}
+
+function disconnectGuildMember(guildId: string, userId: string) {
+    return patchGuildMember(guildId, userId, { channel_id: null }, {
+        verb: "disconnect",
+        pastTense: "disconnected from voice",
+        presentParticiple: "disconnecting"
+    });
+}
+
+function serverMuteGuildMember(guildId: string, userId: string) {
+    return patchGuildMember(guildId, userId, { mute: true }, {
+        verb: "server mute",
+        pastTense: "server muted",
+        presentParticiple: "server muting"
+    });
+}
+
+function serverDeafenGuildMember(guildId: string, userId: string) {
+    return patchGuildMember(guildId, userId, { deaf: true }, {
+        verb: "server deafen",
+        pastTense: "server deafened",
+        presentParticiple: "server deafening"
+    });
 }
 
 interface UserContextProps {
@@ -165,19 +208,35 @@ interface UserContextProps {
 
 const UserContext: NavContextMenuPatchCallback = (children, { user }: UserContextProps) => {
     if (!user || user.id === UserStore.getCurrentUser().id) return;
-    const isActive = settings.store.disconnectUserId === user.id;
-    const label = "Disconnect user";
-    const icon = isActive ? UnfollowIcon : FollowIcon;
+    const isDisconnectActive = settings.store.disconnectUserId === user.id;
+    const isServerMuteActive = settings.store.serverMuteUserId === user.id;
+    const isServerDeafenActive = settings.store.serverDeafenUserId === user.id;
 
     children.splice(-1, 0, (
         <Menu.MenuGroup key="disconnect-user-group">
             <Menu.MenuItem
                 id="disconnect-user"
-                label={label}
+                label="Disconnect user"
                 action={() => {
-                    settings.store.disconnectUserId = isActive ? "" : user.id;
+                    settings.store.disconnectUserId = isDisconnectActive ? "" : user.id;
                 }}
-                icon={icon}
+                icon={isDisconnectActive ? UnfollowIcon : FollowIcon}
+            />
+            <Menu.MenuItem
+                id="server-mute-user"
+                label="Server mute user"
+                action={() => {
+                    settings.store.serverMuteUserId = isServerMuteActive ? "" : user.id;
+                }}
+                icon={isServerMuteActive ? UnfollowIcon : FollowIcon}
+            />
+            <Menu.MenuItem
+                id="server-deafen-user"
+                label="Server deafen user"
+                action={() => {
+                    settings.store.serverDeafenUserId = isServerDeafenActive ? "" : user.id;
+                }}
+                icon={isServerDeafenActive ? UnfollowIcon : FollowIcon}
             />
         </Menu.MenuGroup>
     ));
@@ -196,10 +255,7 @@ export default definePlugin({
                 match: /(\((\i),\i\){.+?\.flipped])(:\i}\),children:\[)/,
                 replace: "$1$3$self.renderButtons($2?.user),"
             }
-        }
-    ],
-
-    patches: [
+        },
         {
             find: "toolbar:function",
             replacement: {
@@ -215,44 +271,89 @@ export default definePlugin({
 
     flux: {
         VOICE_STATE_UPDATES({ voiceStates }: { voiceStates: VoiceState[]; }) {
-            const targetUserId = settings.store.disconnectUserId;
-            if (!targetUserId) return;
+            const { disconnectUserId, serverMuteUserId, serverDeafenUserId } = settings.store;
+            if (!disconnectUserId && !serverMuteUserId && !serverDeafenUserId) return;
 
             for (const { userId, channelId, oldChannelId } of voiceStates) {
-                if (userId !== targetUserId) continue;
+                if (userId !== disconnectUserId && userId !== serverMuteUserId && userId !== serverDeafenUserId) continue;
                 if (channelId && channelId !== oldChannelId) {
                     const channel = ChannelStore.getChannel(channelId);
                     if (!channel) continue;
                     const guildId = (channel as any).guild_id ?? (channel as any).guildId;
                     if (!guildId) continue;
 
-                    if (!PermissionStore.can(PermissionsBits.MOVE_MEMBERS, channel)) {
-                        Toasts.show({
-                            message: "Missing MOVE_MEMBERS permission to disconnect user",
-                            id: Toasts.genId(),
-                            type: Toasts.Type.FAILURE
-                        });
-                        continue;
+                    if (userId === disconnectUserId) {
+                        if (!PermissionStore.can(PermissionsBits.MOVE_MEMBERS, channel)) {
+                            Toasts.show({
+                                message: "Missing MOVE_MEMBERS permission to disconnect user",
+                                id: Toasts.genId(),
+                                type: Toasts.Type.FAILURE
+                            });
+                        } else {
+                            void disconnectGuildMember(guildId, userId);
+                        }
                     }
 
-                    void disconnectGuildMember(guildId, userId);
+                    if (userId === serverMuteUserId) {
+                        if (!PermissionStore.can(PermissionsBits.MUTE_MEMBERS, channel)) {
+                            Toasts.show({
+                                message: "Missing MUTE_MEMBERS permission to server mute user",
+                                id: Toasts.genId(),
+                                type: Toasts.Type.FAILURE
+                            });
+                        } else {
+                            void serverMuteGuildMember(guildId, userId);
+                        }
+                    }
+
+                    if (userId === serverDeafenUserId) {
+                        if (!PermissionStore.can(PermissionsBits.DEAFEN_MEMBERS, channel)) {
+                            Toasts.show({
+                                message: "Missing DEAFEN_MEMBERS permission to server deafen user",
+                                id: Toasts.genId(),
+                                type: Toasts.Type.FAILURE
+                            });
+                        } else {
+                            void serverDeafenGuildMember(guildId, userId);
+                        }
+                    }
                 }
             }
         },
     },
 
     FollowIndicator() {
-        const { plugins: { DisconnectUser: { disconnectUserId } } } = useSettings(["plugins.DisconnectUser.disconnectUserId"]);
-        if (disconnectUserId) {
-            const current = UserStore.getUser(disconnectUserId);
+        const {
+            plugins: {
+                DisconnectUser: {
+                    disconnectUserId,
+                    serverMuteUserId,
+                    serverDeafenUserId
+                }
+            }
+        } = useSettings([
+            "plugins.DisconnectUser.disconnectUserId",
+            "plugins.DisconnectUser.serverMuteUserId",
+            "plugins.DisconnectUser.serverDeafenUserId"
+        ]);
+
+        const activeActions = [
+            disconnectUserId && `Disconnect: ${UserStore.getUser(disconnectUserId)?.username ?? disconnectUserId}`,
+            serverMuteUserId && `Server mute: ${UserStore.getUser(serverMuteUserId)?.username ?? serverMuteUserId}`,
+            serverDeafenUserId && `Server deafen: ${UserStore.getUser(serverDeafenUserId)?.username ?? serverDeafenUserId}`
+        ].filter(Boolean);
+
+        if (activeActions.length) {
             return (
                 <HeaderBarIcon
-                    tooltip={`Disconnect user: ${current?.username ?? disconnectUserId} (right-click to disable)`}
+                    tooltip={`${activeActions.join("\n")} (right-click to disable all)`}
                     icon={UnfollowIcon}
                     onClick={() => { }}
-                    onContextMenu={(e) => {
+                    onContextMenu={e => {
                         e.preventDefault();
                         settings.store.disconnectUserId = "";
+                        settings.store.serverMuteUserId = "";
+                        settings.store.serverDeafenUserId = "";
                     }}
                 />
             );
